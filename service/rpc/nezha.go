@@ -2,115 +2,377 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"sync"
 	"time"
 
-	"github.com/naiba/nezha/model"
-	"github.com/naiba/nezha/pkg/utils"
-	pb "github.com/naiba/nezha/proto"
-	"github.com/naiba/nezha/service/dao"
+	"github.com/jinzhu/copier"
+	"github.com/nezhahq/nezha/pkg/tsdb"
+
+	"github.com/nezhahq/nezha/model"
+	pb "github.com/nezhahq/nezha/proto"
+	"github.com/nezhahq/nezha/service/singleton"
 )
 
+var _ pb.NezhaServiceServer = (*NezhaHandler)(nil)
+
+var NezhaHandlerSingleton *NezhaHandler
+
+// ErrRequestTaskStreamSuperseded is returned when a RequestTask result arrives
+// after its stream is no longer the live stream for the authenticated server.
+var ErrRequestTaskStreamSuperseded = errors.New("request task stream superseded")
+
 type NezhaHandler struct {
-	Auth *AuthHandler
+	Auth                   *authHandler
+	ioStreams              map[string]*ioStreamContext
+	ioStreamMutex          *sync.RWMutex
+	ioStreamGeneration     uint64
+	ioStreamNotify         chan struct{}
+	ioStreamWaitLockedHook func()
+	// Capability authorization and exact stream deletion share ioStreamMutex to avoid TOCTOU.
+	agentCompatCapabilities agentCompatCapabilityState
 }
 
-func (s *NezhaHandler) ReportTask(c context.Context, r *pb.TaskResult) (*pb.Receipt, error) {
-	var err error
-	var clientID uint64
-	if clientID, err = s.Auth.Check(c); err != nil {
-		return nil, err
+type serverMetricsWriter func(*tsdb.ServerMetrics) error
+
+var writeServerMetrics serverMetricsWriter = writeServerMetricsToTSDB
+
+func writeServerMetricsToTSDB(metrics *tsdb.ServerMetrics) error {
+	if !singleton.TSDBEnabled() {
+		return nil
 	}
-	if r.GetType() == model.TaskTypeCommand {
-		// 处理上报的计划任务
-		dao.CronLock.RLock()
-		defer dao.CronLock.RUnlock()
-		cr := dao.Crons[r.GetId()]
-		if cr != nil {
-			dao.ServerLock.RLock()
-			defer dao.ServerLock.RUnlock()
-			if cr.PushSuccessful && r.GetSuccessful() {
-				dao.SendNotification(fmt.Sprintf("[任务成功] %s ，服务器：%s，日志：\n%s", cr.Name, dao.ServerList[clientID].Name, r.GetData()), false)
-			}
-			if !r.GetSuccessful() {
-				dao.SendNotification(fmt.Sprintf("[任务失败] %s ，服务器：%s，日志：\n%s", cr.Name, dao.ServerList[clientID].Name, r.GetData()), false)
-			}
-			dao.DB.Model(cr).Updates(model.Cron{
-				LastExecutedAt: time.Now().Add(time.Second * -1 * time.Duration(r.GetDelay())),
-				LastResult:     r.GetSuccessful(),
-			})
-		}
-	} else if model.IsServiceSentinelNeeded(r.GetType()) {
-		dao.ServiceSentinelShared.Dispatch(dao.ReportData{
-			Data:     r,
-			Reporter: clientID,
-		})
-	}
-	return &pb.Receipt{Proced: true}, nil
+	return singleton.TSDBShared.WriteServerMetrics(metrics)
 }
 
-func (s *NezhaHandler) RequestTask(h *pb.Host, stream pb.NezhaService_RequestTaskServer) error {
+func NewNezhaHandler() *NezhaHandler {
+	handler := &NezhaHandler{
+		Auth:           &authHandler{},
+		ioStreamMutex:  new(sync.RWMutex),
+		ioStreams:      make(map[string]*ioStreamContext),
+		ioStreamNotify: make(chan struct{}),
+	}
+	handler.initializeAgentCompatCapabilities()
+	return handler
+}
+
+// attachRequestTaskStream resolves the server for clientID and publishes the
+// task stream. It mirrors the !ok || server == nil guard the other RPC entry
+// points use: the server can be deleted between CheckRequestTask and this
+// lookup, in which case Get returns a nil *Server and SetTaskStream would
+// panic.
+func attachRequestTaskStream(clientID uint64, stream pb.NezhaService_RequestTaskServer) (*model.Server, bool) {
+	server, ok := singleton.ServerShared.Get(clientID)
+	if !ok || server == nil {
+		return nil, false
+	}
+	server.SetTaskStream(stream)
+	return server, true
+}
+
+// clearRequestTaskStream detaches the dropped stream from whichever *Server is
+// currently published for clientID. Edit and transfer rotation publish a new
+// *Server that adopts the same stream holder, so cleanup must target the live
+// map entry; the captured server is only the fallback for a removed entry.
+func clearRequestTaskStream(clientID uint64, captured *model.Server, stream pb.NezhaService_RequestTaskServer) {
+	if current, ok := singleton.ServerShared.Get(clientID); ok && current != nil {
+		current.ClearTaskStreamIfCurrent(stream)
+		return
+	}
+	captured.ClearTaskStreamIfCurrent(stream)
+}
+
+// currentRequestTaskServer authorizes a received result against the live
+// ServerShared entry. Server pointer replacement is valid when it inherited
+// the same task stream holder; only a missing entry or different stream makes
+// a received result stale.
+func currentRequestTaskServer(clientID uint64, stream pb.NezhaService_RequestTaskServer) (*model.Server, error) {
+	current, ok := singleton.ServerShared.Get(clientID)
+	if !ok || current == nil || current.GetTaskStream() != stream {
+		return nil, ErrRequestTaskStreamSuperseded
+	}
+	return current, nil
+}
+
+func (s *NezhaHandler) RequestTask(stream pb.NezhaService_RequestTaskServer) error {
 	var clientID uint64
 	var err error
-	if clientID, err = s.Auth.Check(stream.Context()); err != nil {
+	if clientID, err = s.Auth.CheckRequestTask(stream.Context()); err != nil {
 		return err
 	}
-	closeCh := make(chan error)
-	dao.ServerLock.RLock()
-	dao.ServerList[clientID].TaskStream = stream
-	dao.ServerList[clientID].TaskClose = closeCh
-	dao.ServerLock.RUnlock()
-	return <-closeCh
+
+	server, ok := attachRequestTaskStream(clientID, stream)
+	if !ok {
+		return nil
+	}
+	defer clearRequestTaskStream(clientID, server, stream)
+	// If a transfer is mid-flight for this server, the agent has just brought
+	// up a fresh bidi stream — this is the moment to (re)deliver the
+	// ApplyConfig task carrying the new owner's AgentSecret. Pushes from
+	// dashboard mutation time are best-effort; this hook is the reliable
+	// re-delivery point that closes the offline-during-transfer gap.
+	if singleton.ServerTransferShared != nil {
+		singleton.ServerTransferShared.OnAgentReconnect(clientID)
+	}
+	// Returning the handler cancels the real gRPC stream and wakes a blocked Send.
+	// A single receiver allows the handler to observe send-side failure while Recv waits.
+	failed := server.TaskStreamFailure(stream)
+	type taskReception struct {
+		result *pb.TaskResult
+		err    error
+	}
+	received := make(chan taskReception)
+	receiveStop := make(chan struct{})
+	defer close(receiveStop)
+	go func() {
+		for {
+			result, err := stream.Recv()
+			select {
+			case received <- taskReception{result, err}:
+			case <-receiveStop:
+				return
+			case <-stream.Context().Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	var result *pb.TaskResult
+	for {
+		select {
+		case <-failed:
+			if _, err := currentRequestTaskServer(clientID, stream); err != nil {
+				return err
+			}
+			return model.ErrTaskStreamStalled
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case reception := <-received:
+			result, err = reception.result, reception.err
+		}
+		if err != nil {
+			log.Printf("NEZHA>> RequestTask error: %v, clientID: %d\n", err, clientID)
+			return err
+		}
+		server, err = currentRequestTaskServer(clientID, stream)
+		if err != nil {
+			return err
+		}
+		// Task latency is untrusted and is later aggregated into JSON service statistics.
+		if result != nil {
+			result.Delay = float32(model.FiniteStateValue(float64(result.Delay)))
+		}
+		switch result.GetType() {
+		case model.TaskTypeCommand:
+			// 处理上报的计划任务
+			cr, _ := singleton.CronShared.Get(result.GetId())
+			// 任务结果 ID 来自 agent，必须确认该 cron 本应派发给当前 reporter。
+			if singleton.CanReportCronResult(cr, server) {
+				// 保存当前服务器状态信息
+				var curServer model.Server
+				copier.Copy(&curServer, server)
+				if cr.PushSuccessful && result.GetSuccessful() {
+					singleton.NotificationShared.SendNotification(cr.NotificationGroupID, fmt.Sprintf("[%s] %s, %s\n%s", singleton.Localizer.T("Scheduled Task Executed Successfully"),
+						cr.Name, server.Name, result.GetData()), "", &curServer)
+				}
+				if !result.GetSuccessful() {
+					singleton.NotificationShared.SendNotification(cr.NotificationGroupID, fmt.Sprintf("[%s] %s, %s\n%s", singleton.Localizer.T("Scheduled Task Executed Failed"),
+						cr.Name, server.Name, result.GetData()), "", &curServer)
+				}
+				singleton.DB.Model(cr).Updates(model.Cron{
+					LastExecutedAt: time.Now().Add(time.Second * -1 * time.Duration(result.GetDelay())),
+					LastResult:     result.GetSuccessful(),
+				})
+			}
+		case model.TaskTypeReportConfig:
+			if len(server.ConfigCache) < 1 {
+				if !result.GetSuccessful() {
+					server.ConfigCache <- errors.New(result.Data)
+					continue
+				}
+				server.ConfigCache <- result.Data
+			}
+		case model.TaskTypeServerTransferApply:
+			// Authorization: TaskResult.Id is attacker-controlled. Without
+			// the pending.ID == result.Id check below, agent A could cancel
+			// server B's in-flight transfer by spoofing B's transfer ID —
+			// same class of bug as commit 02129f1 in the cron path.
+			// Successful=true here is best-effort only; the authoritative
+			// verification is the agent's reconnect under the new secret.
+			if singleton.ServerTransferShared == nil {
+				continue
+			}
+			pending, ok := singleton.ServerTransferShared.LookupPending(clientID)
+			if !ok || pending.ID != result.GetId() {
+				log.Printf("NEZHA>> ServerTransferApply result ignored: clientID=%d reported transferID=%d but no matching pending transfer", clientID, result.GetId())
+				continue
+			}
+			if result.GetSuccessful() {
+				continue
+			}
+			// Rollback may wait for a guarded Send's control lease. Keep the
+			// handler free to return on send failure: gRPC cancels Send only
+			// after this handler returns. At most one rollback worker exists
+			// per stream, and it finishes once transport cancellation frees Send.
+			transfer, transferID, reason := singleton.ServerTransferShared, result.GetId(), result.GetData()
+			rolledBack := make(chan error, 1)
+			go func() {
+				_, err := transfer.MarkFailed(transferID, reason)
+				if err != nil {
+					log.Printf("NEZHA>> ServerTransfer MarkFailed(%d) failed: %v", transferID, err)
+				}
+				rolledBack <- err
+			}()
+			select {
+			case <-rolledBack:
+			case <-failed:
+				return model.ErrTaskStreamStalled
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			}
+		default:
+			if model.IsMCPRPCResult(result.GetType()) {
+				deliverMCPResultFromReporter(result, clientID)
+				continue
+			}
+			if model.IsServiceSentinelNeeded(result.GetType()) {
+				singleton.ServiceSentinelShared.Dispatch(singleton.ReportData{
+					Data:     result,
+					Reporter: clientID,
+				})
+			}
+		}
+	}
 }
 
-func (s *NezhaHandler) ReportSystemState(c context.Context, r *pb.State) (*pb.Receipt, error) {
+func (s *NezhaHandler) ReportSystemState(stream pb.NezhaService_ReportSystemStateServer) error {
+	clientID, err := s.Auth.Check(stream.Context())
+	if err != nil {
+		return err
+	}
+	server, ok := singleton.ServerShared.Get(clientID)
+	if !ok || server == nil {
+		return errors.New("server not found")
+	}
+	lease := server.AttachStateStream(stream)
+	defer func() {
+		// Persist while owning the lease; a replaced stream must never close a
+		// newer stream's session between Clear and RecordOffline.
+		lease.ClearWithSideEffect(func() {
+			if singleton.OnlineHistoryShared != nil {
+				singleton.OnlineHistoryShared.RecordOffline(clientID, time.Now())
+			}
+		})
+	}()
+	var state *pb.State
+	var stateCount uint64
+	for {
+		state, err = stream.Recv()
+		if err != nil {
+			log.Printf("NEZHA>> ReportSystemState error: %v, clientID: %d\n", err, clientID)
+			return err
+		}
+		stateCount++
+		innerState := model.PB2State(state)
+
+		lastActive := time.Now()
+		accepted := lease.UpdateStateWithSideEffect(&innerState, lastActive, func() error {
+			{
+				maxTemp := 0.0
+				for _, t := range innerState.Temperatures {
+					if t.Temperature > maxTemp {
+						maxTemp = t.Temperature
+					}
+				}
+				maxGPU := 0.0
+				for _, g := range innerState.GPU {
+					if g > maxGPU {
+						maxGPU = g
+					}
+				}
+				if err := writeServerMetrics(&tsdb.ServerMetrics{
+					ServerID:       clientID,
+					Timestamp:      lastActive,
+					CPU:            innerState.CPU,
+					MemUsed:        innerState.MemUsed,
+					SwapUsed:       innerState.SwapUsed,
+					DiskUsed:       innerState.DiskUsed,
+					NetInSpeed:     innerState.NetInSpeed,
+					NetOutSpeed:    innerState.NetOutSpeed,
+					NetInTransfer:  innerState.NetInTransfer,
+					NetOutTransfer: innerState.NetOutTransfer,
+					Load1:          innerState.Load1,
+					Load5:          innerState.Load5,
+					Load15:         innerState.Load15,
+					TCPConnCount:   innerState.TcpConnCount,
+					UDPConnCount:   innerState.UdpConnCount,
+					ProcessCount:   innerState.ProcessCount,
+					Temperature:    maxTemp,
+					Uptime:         innerState.Uptime,
+					GPU:            maxGPU,
+				}); err != nil {
+					log.Printf("NEZHA>> Failed to write server metrics to TSDB: %v", err)
+				}
+			}
+			if singleton.OnlineHistoryShared != nil {
+				singleton.OnlineHistoryShared.RecordOnline(clientID, lastActive)
+			}
+			return nil
+		})
+		if !accepted {
+			return errors.New("state stream superseded")
+		}
+
+		if err := notifyStateReceived(clientID, server.UUID, lease.Generation(), stateCount); err != nil {
+			return err
+		}
+		if err := notifyReceiptAccepted(clientID, server.UUID, lease.Generation(), stateCount); err != nil {
+			return err
+		}
+		if err = stream.Send(&pb.Receipt{Proced: true}); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *NezhaHandler) onReportSystemInfo(c context.Context, r *pb.Host) (model.HostReportResult, error) {
 	var clientID uint64
 	var err error
 	if clientID, err = s.Auth.Check(c); err != nil {
-		return nil, err
+		return model.HostReportResult{}, err
 	}
-	state := model.PB2State(r)
-	dao.ServerLock.RLock()
-	defer dao.ServerLock.RUnlock()
-	dao.ServerList[clientID].LastActive = time.Now()
-	dao.ServerList[clientID].State = &state
+	host := model.PB2Host(r)
 
-	// 如果从未记录过，先打点，等到小时时间点时入库
-	if dao.ServerList[clientID].PrevHourlyTransferIn == 0 || dao.ServerList[clientID].PrevHourlyTransferOut == 0 {
-		dao.ServerList[clientID].PrevHourlyTransferIn = int64(state.NetInTransfer)
-		dao.ServerList[clientID].PrevHourlyTransferOut = int64(state.NetOutTransfer)
+	server, ok := singleton.ServerShared.Get(clientID)
+	if !ok || server == nil {
+		return model.HostReportResult{}, errors.New("server not found")
 	}
 
-	return &pb.Receipt{Proced: true}, nil
+	/**
+	 * 这里的 singleton 中的数据都是关机前的旧数据
+	 * 当 agent 重启时，bootTime 变大，agent 端会先上报 host 信息，然后上报 state 信息
+	 * 这时可以借助上报顺序的空档，立即记录停机前的数据并重置 Prev* 数据，并由接下来的 state 方法重新赋值
+	 */
+	return server.RuntimeHandle().ApplyHostReport(&host, time.Now(), singleton.PersistTransfer)
 }
 
 func (s *NezhaHandler) ReportSystemInfo(c context.Context, r *pb.Host) (*pb.Receipt, error) {
-	var clientID uint64
-	var err error
-	if clientID, err = s.Auth.Check(c); err != nil {
+	if _, err := s.onReportSystemInfo(c, r); err != nil {
 		return nil, err
 	}
-	host := model.PB2Host(r)
-	dao.ServerLock.RLock()
-	defer dao.ServerLock.RUnlock()
-	if dao.Conf.EnableIPChangeNotification &&
-		((dao.Conf.Cover == model.ConfigCoverAll && !dao.Conf.IgnoredIPNotificationServerIDs[clientID]) ||
-			(dao.Conf.Cover == model.ConfigCoverIgnoreAll && dao.Conf.IgnoredIPNotificationServerIDs[clientID])) &&
-		dao.ServerList[clientID].Host != nil &&
-		dao.ServerList[clientID].Host.IP != "" &&
-		host.IP != "" &&
-		dao.ServerList[clientID].Host.IP != host.IP {
-		dao.SendNotification(fmt.Sprintf(
-			"[IP变更] %s ，旧IP：%s，新IP：%s。",
-			dao.ServerList[clientID].Name, utils.IPDesensitize(dao.ServerList[clientID].Host.IP), utils.IPDesensitize(host.IP)), true)
-	}
-
-	// 判断是否是机器重启，如果是机器重启要录入最后记录的流量里面
-	if dao.ServerList[clientID].Host.BootTime < host.BootTime {
-		dao.ServerList[clientID].PrevHourlyTransferIn = dao.ServerList[clientID].PrevHourlyTransferIn - int64(dao.ServerList[clientID].State.NetInTransfer)
-		dao.ServerList[clientID].PrevHourlyTransferOut = dao.ServerList[clientID].PrevHourlyTransferOut - int64(dao.ServerList[clientID].State.NetOutTransfer)
-	}
-
-	dao.ServerList[clientID].Host = &host
 	return &pb.Receipt{Proced: true}, nil
+}
+
+func (s *NezhaHandler) ReportSystemInfo2(c context.Context, r *pb.Host) (*pb.Uint64Receipt, error) {
+	result, err := s.onReportSystemInfo(c, r)
+	if err != nil {
+		return nil, err
+	}
+	if err := notifyInfo2(result.ServerID, result.UUID); err != nil {
+		return nil, err
+	}
+	return &pb.Uint64Receipt{Data: singleton.DashboardBootTime}, nil
 }

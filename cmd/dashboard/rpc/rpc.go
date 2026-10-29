@@ -1,59 +1,44 @@
 package rpc
 
 import (
-	"fmt"
 	"net"
 
 	"google.golang.org/grpc"
 
-	"github.com/naiba/nezha/model"
-	pb "github.com/naiba/nezha/proto"
-	"github.com/naiba/nezha/service/dao"
-	rpcService "github.com/naiba/nezha/service/rpc"
+	"github.com/nezhahq/nezha/proto"
+	rpcService "github.com/nezhahq/nezha/service/rpc"
+	"github.com/nezhahq/nezha/service/singleton"
 )
 
-func ServeRPC(port uint) {
-	server := grpc.NewServer()
-	pb.RegisterNezhaServiceServer(server, &rpcService.NezhaHandler{
-		Auth: &rpcService.AuthHandler{},
-	})
-	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		panic(err)
-	}
-	server.Serve(listen)
+func SetReceiptGateListener(listener net.Listener) {
+	rpcService.SetReceiptGateListener(listener)
 }
 
-func DispatchTask(serviceSentinelDispatchBus <-chan model.Monitor) {
-	workedServerIndex := 0
-	for task := range serviceSentinelDispatchBus {
-		round := 0
-		endIndex := workedServerIndex
-		dao.SortedServerLock.RLock()
-		// 如果已经轮了一整圈又轮到自己，没有合适机器去请求，跳出循环
-		for round < 1 || workedServerIndex < endIndex {
-			// 如果到了圈尾，再回到圈头，圈数加一，游标重置
-			if workedServerIndex >= len(dao.SortedServerList) {
-				workedServerIndex = 0
-				round++
-				continue
-			}
-			// 如果服务器不在线，跳过这个服务器
-			if dao.SortedServerList[workedServerIndex].TaskStream == nil {
-				workedServerIndex++
-				continue
-			}
-			// 如果此任务不可使用此服务器请求，跳过这个服务器（有些 IPv6 only 开了 NAT64 的机器请求 IPv4 总会出问题）
-			if (task.Cover == model.MonitorCoverAll && task.SkipServers[dao.SortedServerList[workedServerIndex].ID]) ||
-				(task.Cover == model.MonitorCoverIgnoreAll && !task.SkipServers[dao.SortedServerList[workedServerIndex].ID]) {
-				workedServerIndex++
-				continue
-			}
-			// 找到合适机器执行任务，跳出循环
-			dao.SortedServerList[workedServerIndex].TaskStream.Send(task.PB())
-			workedServerIndex++
-			break
-		}
-		dao.SortedServerLock.RUnlock()
-	}
+func CloseReceiptGate() {
+	rpcService.CloseReceiptGate()
+}
+
+// SetMCPKillSwitchObserver re-exports the service/rpc hook so cmd/dashboard
+// can wire singleton.Conf.EnableMCP without importing the inner rpc package
+// (cmd/dashboard already imports cmd/dashboard/rpc for ServeRPC).
+func SetMCPKillSwitchObserver(fn func() bool) {
+	rpcService.SetMCPKillSwitchObserver(fn)
+}
+
+func ServeRPC() *grpc.Server {
+	// Streaming RPCs (RequestTask, IOStream) need the same real-IP + WAF
+	// gate as unary calls; without the stream interceptors authHandler.check
+	// sees an empty real IP, so brute-force BlockIP counters never key on a
+	// source and the WAF block table is bypassed at the stream entrypoint.
+	server := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(getRealIp, waf),
+		grpc.ChainStreamInterceptor(getRealIpStream, wafStream),
+	)
+	rpcService.NezhaHandlerSingleton = rpcService.NewNezhaHandler()
+	// Install the IOStream revocation hook so ServerTransferShared can tear
+	// down terminal/FM/NAT sessions held by the previous owner on every
+	// ownership rotation (Register/revertTransition/OnServersDeleted).
+	singleton.ServerTransferStreamRevocationHook = rpcService.NezhaHandlerSingleton.RevokeStreamsForServer
+	proto.RegisterNezhaServiceServer(server, rpcService.NezhaHandlerSingleton)
+	return server
 }

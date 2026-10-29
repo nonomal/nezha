@@ -1,21 +1,21 @@
-FROM golang:alpine AS binarybuilder
-RUN apk --no-cache --no-progress add \
-    gcc git musl-dev
-WORKDIR /dashboard
-COPY . .
-RUN cd cmd/dashboard && go build -o app -ldflags="-s -w"
+FROM alpine AS depend
+RUN apk add --update --no-cache ca-certificates tzdata
 
-FROM alpine:latest
-ENV TZ="Asia/Shanghai"
-RUN apk --no-cache --no-progress add \
-    ca-certificates \
-    tzdata && \
-    cp "/usr/share/zoneinfo/$TZ" /etc/localtime && \
-    echo "$TZ" >  /etc/timezone
+FROM busybox:stable-musl
+
+ARG TARGETOS
+ARG TARGETARCH
+
+COPY --from=depend /etc/ssl/certs /etc/ssl/certs
+COPY --from=depend /usr/share/zoneinfo /usr/share/zoneinfo
+COPY ./script/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 WORKDIR /dashboard
-COPY ./resource ./resource
-COPY --from=binarybuilder /dashboard/cmd/dashboard/app ./app
+COPY dist/dashboard-${TARGETOS}-${TARGETARCH} ./app
 
 VOLUME ["/dashboard/data"]
-EXPOSE 80 5555
-CMD ["/dashboard/app"]
+EXPOSE 8008
+ARG TZ=Asia/Shanghai
+ENV TZ=$TZ
+ENTRYPOINT ["/entrypoint.sh"]
